@@ -1,0 +1,440 @@
+import React, { useMemo, useState } from 'react';
+import * as XLSX from 'xlsx';
+
+/**
+ * BizPlan Calculator – One-Page Feasibility App (Simplified)
+ * Fixes: remove file-saver dependency; use XLSX.writeFile for export
+ * Adds: CAPEX+OPEX with explanations & depreciation, profit plan, cashflow projection,
+ *       loan repayment plan (amortization), dashboard, Excel export (multi-sheet),
+ *       and lightweight self-tests for finance helpers.
+ */
+
+// ---------- Helpers ----------
+const CURRENCY = (n) =>
+  new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(
+    isFinite(n) ? n : 0
+  );
+
+function sum(arr) {
+  return arr.reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
+}
+
+function anuitas(P, i, n) {
+  // i = rate per period (monthly); n = number of payments
+  if (n <= 0) return 0;
+  if (i === 0) return P / n;
+  return (P * i) / (1 - Math.pow(1 + i, -n));
+}
+
+function amortize({ principal, annualRate = 6, months = 72, graceMonths = 6, mode = 'pokok' /* 'pokok' | 'full' */ }) {
+  const i = annualRate / 100 / 12; // monthly rate
+  let saldo = principal;
+  const rows = [];
+
+  // Grace phase
+  for (let m = 1; m <= graceMonths && m <= months; m++) {
+    const bunga = saldo * i;
+    let bayar = 0;
+    if (mode === 'pokok') {
+      bayar = bunga; // pay interest only
+    } else {
+      // full grace: capitalize interest
+      saldo += bunga;
+      bayar = 0;
+    }
+    rows.push({ month: m, principal: 0, interest: bunga, payment: bayar, balance: saldo });
+  }
+
+  // Regular amortization
+  const remain = Math.max(0, months - graceMonths);
+  const A = anuitas(saldo, i, remain);
+  for (let k = 1; k <= remain; k++) {
+    const bunga = saldo * i;
+    const pokok = Math.max(0, A - bunga);
+    saldo = Math.max(0, saldo - pokok);
+    rows.push({ month: graceMonths + k, principal: pokok, interest: bunga, payment: A, balance: saldo });
+  }
+
+  return rows;
+}
+
+function paybackPeriod(cashflows) {
+  // cashflows[0] expected negative initial; returns month index where cum >= 0
+  let cum = 0;
+  for (let i = 0; i < cashflows.length; i++) {
+    cum += cashflows[i];
+    if (cum >= 0) return i;
+  }
+  return Infinity;
+}
+
+// --------- Lightweight Tests (do not modify unless failing) ---------
+(function selfTests() {
+  // anuitas test: P=1200, i=1%/mo, n=12 → payment around 106.62
+  const testA = anuitas(1200, 0.01, 12);
+  console.assert(Math.abs(testA - 106.62) < 0.5, 'anuitas test failed');
+
+  // amortize test: no grace, i=0 → payment = P/n
+  const sched = amortize({ principal: 1200, annualRate: 0, months: 12, graceMonths: 0 });
+  console.assert(Math.abs(sched[0].payment - 100) < 1e-6, 'amortize zero-rate payment failed');
+  console.assert(Math.abs(sched.at(-1).balance - 0) < 1e-3, 'amortize ending balance failed');
+})();
+
+export default function BizPlanCalculator() {
+  // ---------- Inputs ----------
+  const [horizon, setHorizon] = useState(72); // months projection
+  const [growthPct, setGrowthPct] = useState(0); // monthly revenue growth %
+
+  // CAPEX: item, nilai (Rp), umur (tahun)
+  const [capex, setCapex] = useState([{ item: 'Rak & Etalase', nilai: 80000000, umur: 5 }]);
+  // OPEX: item, nilai (Rp/bulan)
+  const [opex, setOpex] = useState([
+    { item: 'Gaji & Operasional', nilai: 20000000 },
+    { item: 'Sewa & Utilitas', nilai: 10000000 },
+  ]);
+
+  // Profit & Revenue Plan
+  const [targetMarginPct, setTargetMarginPct] = useState(10); // % dari pendapatan → laba target
+  const [revenueStart, setRevenueStart] = useState(150000000); // pendapatan awal/bulan
+
+  // Financing
+  const [plafon, setPlafon] = useState(500000000); // total loan principal
+  const [tenor, setTenor] = useState(72);
+  const [bunga, setBunga] = useState(6);
+  const [grace, setGrace] = useState(6);
+  const [modeGrace, setModeGrace] = useState('pokok');
+
+  // ---------- Derived values ----------
+  const penyusutanBulanan = useMemo(() => {
+    // Straight-line; umur in years → months
+    return sum(capex.map((c) => (c.umur > 0 ? c.nilai / (c.umur * 12) : 0)));
+  }, [capex]);
+
+  const totalCapex = useMemo(() => sum(capex.map((c) => Number(c.nilai) || 0)), [capex]);
+  const totalOpex = useMemo(() => sum(opex.map((o) => Number(o.nilai) || 0)), [opex]);
+
+  const revenueSeries = useMemo(() => {
+    const g = (Number(growthPct) || 0) / 100;
+    const arr = [];
+    for (let m = 0; m < horizon; m++) {
+      arr.push(revenueStart * Math.pow(1 + g, m));
+    }
+    return arr;
+  }, [revenueStart, growthPct, horizon]);
+
+  const loanSchedule = useMemo(
+    () => amortize({ principal: plafon, annualRate: bunga, months: tenor, graceMonths: grace, mode: modeGrace }),
+    [plafon, bunga, tenor, grace, modeGrace]
+  );
+
+  const cashflowRows = useMemo(() => {
+    const rows = [];
+    for (let m = 1; m <= horizon; m++) {
+      const pendapatan = revenueSeries[m - 1] || 0;
+      const biayaOperasi = totalOpex; // simplified monthly OPEX
+      const ebitda = pendapatan - biayaOperasi;
+      const ebit = ebitda - penyusutanBulanan;
+
+      const debt = loanSchedule[m - 1] || { interest: 0, payment: 0, balance: plafon };
+      const labaSebelumPajak = ebit - debt.interest; // pajak diabaikan (MVP)
+      const cfo = labaSebelumPajak + penyusutanBulanan; // add back depreciation
+      const cff = -debt.payment; // debt service
+      const netCF = cfo + cff;
+
+      rows.push({
+        bulan: m,
+        pendapatan,
+        opex: biayaOperasi,
+        penyusutan: penyusutanBulanan,
+        bunga: debt.interest,
+        angsuran: debt.payment,
+        cfo,
+        netCF,
+        saldoPinjaman: debt.balance,
+      });
+    }
+    // initial outflow (month 0): invest CAPEX (negative) + loan inflow (positive)
+    const initialCF = -totalCapex + plafon; // modal kerja bisa ditambahkan nanti jika diperlukan
+    return { rows, initialCF };
+  }, [horizon, revenueSeries, totalOpex, penyusutanBulanan, loanSchedule, plafon, totalCapex]);
+
+  // KPI (simplified but useful)
+  const labaTargetBulanan = useMemo(() => (targetMarginPct / 100) * (revenueStart || 0), [targetMarginPct, revenueStart]);
+  const BEP_Bulan = useMemo(() => {
+    const contribution = (revenueStart || 0) - totalOpex; // proxy contrib margin (tanpa biaya variabel/unit)
+    if (contribution <= 0) return Infinity;
+    return Math.ceil(totalCapex / Math.max(1, contribution));
+  }, [revenueStart, totalOpex, totalCapex]);
+
+  const payback = useMemo(() => {
+    const cf = [cashflowRows.initialCF, ...cashflowRows.rows.map((r) => r.netCF)];
+    return paybackPeriod(cf);
+  }, [cashflowRows]);
+
+  // ---------- Export Excel (no file-saver; use XLSX.writeFile) ----------
+  const exportExcel = () => {
+    const wb = XLSX.utils.book_new();
+
+    // KPI Sheet
+    const kpiData = [
+      { KPI: 'Total CAPEX', Value: totalCapex },
+      { KPI: 'Total OPEX/bulan', Value: totalOpex },
+      { KPI: 'Penyusutan/bulan', Value: penyusutanBulanan },
+      { KPI: 'Target Laba/bulan', Value: labaTargetBulanan },
+      { KPI: 'BEP (perkiraan bulan)', Value: BEP_Bulan },
+      { KPI: 'Payback (bulan ke-)', Value: isFinite(payback) ? payback : '> horizon' },
+    ];
+    const wsKPI = XLSX.utils.json_to_sheet(kpiData);
+    XLSX.utils.book_append_sheet(wb, wsKPI, 'KPI');
+
+    // CAPEX Sheet
+    const wsCapex = XLSX.utils.json_to_sheet(capex);
+    XLSX.utils.book_append_sheet(wb, wsCapex, 'CAPEX');
+
+    // OPEX Sheet
+    const wsOpex = XLSX.utils.json_to_sheet(opex);
+    XLSX.utils.book_append_sheet(wb, wsOpex, 'OPEX');
+
+    // Loan Sheet
+    const wsLoan = XLSX.utils.json_to_sheet(
+      (loanSchedule || []).map((r) => ({
+        Bulan: r.month,
+        Pokok: Math.round(r.principal),
+        Bunga: Math.round(r.interest),
+        Angsuran: Math.round(r.payment),
+        Saldo: Math.round(r.balance),
+      }))
+    );
+    XLSX.utils.book_append_sheet(wb, wsLoan, 'Pinjaman');
+
+    // Cashflow Sheet
+    const wsCF = XLSX.utils.json_to_sheet(
+      cashflowRows.rows.map((r) => ({
+        Bulan: r.bulan,
+        Pendapatan: Math.round(r.pendapatan),
+        OPEX: Math.round(r.opex),
+        Penyusutan: Math.round(r.penyusutan),
+        Bunga: Math.round(r.bunga),
+        Angsuran: Math.round(r.angsuran),
+        CFO: Math.round(r.cfo),
+        NetCF: Math.round(r.netCF),
+        SaldoPinjaman: Math.round(r.saldoPinjaman),
+      }))
+    );
+    XLSX.utils.book_append_sheet(wb, wsCF, 'Cashflow');
+
+    XLSX.writeFile(wb, 'Kalkulator_Kelayakan_Bisnis.xlsx');
+  };
+
+  // ---------- Handlers ----------
+  const addCapexRow = () => setCapex([...capex, { item: '', nilai: 0, umur: 5 }]);
+  const addOpexRow = () => setOpex([...opex, { item: '', nilai: 0 }]);
+
+  const handleCapexChange = (index, field, value) => {
+    const updated = [...capex];
+    updated[index][field] = field === 'nilai' || field === 'umur' ? Number(value) : value;
+    setCapex(updated);
+  };
+  const handleOpexChange = (index, field, value) => {
+    const updated = [...opex];
+    updated[index][field] = field === 'nilai' ? Number(value) : value;
+    setOpex(updated);
+  };
+
+  // ---------- UI ----------
+  return (
+    <div className="min-h-screen bg-slate-50 p-6">
+      <div className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* LEFT: Inputs */}
+        <section className="bg-white border rounded-2xl shadow-sm p-6">
+          <h2 className="text-xl font-bold">Input – Kalkulator Kelayakan (1 Halaman)</h2>
+          <p className="text-slate-500 text-sm mt-1">Isi data di bawah. Tooltip memberi penjelasan singkat.</p>
+
+          {/* Projection Controls */}
+          <div className="grid md:grid-cols-3 gap-3 mt-4">
+            <label className="text-sm">Horizon (bulan)
+              <input type="number" min={1} max={120} value={horizon} onChange={(e) => setHorizon(Number(e.target.value))} className="mt-1 w-full border rounded-xl px-3 py-2" />
+            </label>
+            <label className="text-sm">Growth Pendapatan (%/bln)
+              <input type="number" value={growthPct} onChange={(e) => setGrowthPct(Number(e.target.value))} className="mt-1 w-full border rounded-xl px-3 py-2" />
+            </label>
+            <label className="text-sm">Pendapatan Awal/Bulan
+              <input type="number" value={revenueStart} onChange={(e) => setRevenueStart(Number(e.target.value))} className="mt-1 w-full border rounded-xl px-3 py-2" />
+            </label>
+          </div>
+
+          {/* Profit Plan */}
+          <div className="grid md:grid-cols-3 gap-3 mt-4">
+            <label className="text-sm">Target Margin Laba (% dari pendapatan)
+              <input type="number" value={targetMarginPct} onChange={(e) => setTargetMarginPct(Number(e.target.value))} className="mt-1 w-full border rounded-xl px-3 py-2" />
+            </label>
+            <div className="text-xs text-slate-500 md:col-span-2 bg-slate-50 border rounded-xl p-3">Laba target digunakan untuk memantau kesesuaian proyeksi dengan sasaran profit (indikatif).</div>
+          </div>
+
+          {/* CAPEX */}
+          <div className="mt-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-semibold">CAPEX (Belanja Modal)</h3>
+              <button className="px-3 py-2 border rounded-xl" onClick={addCapexRow}>+ Tambah</button>
+            </div>
+            <p className="text-xs text-slate-500 mt-1">Belanja untuk aset jangka panjang (mesin, kendaraan, renovasi). Penyusutan dihitung garis lurus berdasarkan umur ekonomis.</p>
+            <div className="mt-2 space-y-2">
+              {capex.map((row, i) => (
+                <div key={i} className="grid grid-cols-7 gap-2">
+                  <input placeholder="Item" value={row.item} onChange={(e) => handleCapexChange(i, 'item', e.target.value)} className="col-span-3 border rounded-xl px-3 py-2" />
+                  <input type="number" placeholder="Nilai (Rp)" value={row.nilai} onChange={(e) => handleCapexChange(i, 'nilai', e.target.value)} className="col-span-2 border rounded-xl px-3 py-2" />
+                  <input type="number" placeholder="Umur (tahun)" value={row.umur} onChange={(e) => handleCapexChange(i, 'umur', e.target.value)} className="col-span-1 border rounded-xl px-3 py-2" />
+                  <button className="col-span-1 border rounded-xl" onClick={(ev) => { ev.preventDefault(); const arr = [...capex]; arr.splice(i, 1); setCapex(arr); }}>✕</button>
+                </div>
+              ))}
+            </div>
+            <div className="text-xs text-slate-600 mt-2">Total CAPEX: <b>{CURRENCY(totalCapex)}</b> • Penyusutan/bulan: <b>{CURRENCY(penyusutanBulanan)}</b></div>
+          </div>
+
+          {/* OPEX */}
+          <div className="mt-6">
+            <div className="flex items-center justify-between">
+              <h3 className="font-semibold">OPEX (Biaya Operasional Bulanan)</h3>
+              <button className="px-3 py-2 border rounded-xl" onClick={addOpexRow}>+ Tambah</button>
+            </div>
+            <p className="text-xs text-slate-500 mt-1">Biaya berulang: gaji, listrik, sewa, bahan baku rutin, logistik, dll.</p>
+            <div className="mt-2 space-y-2">
+              {opex.map((row, i) => (
+                <div key={i} className="grid grid-cols-6 gap-2">
+                  <input placeholder="Item" value={row.item} onChange={(e) => handleOpexChange(i, 'item', e.target.value)} className="col-span-4 border rounded-xl px-3 py-2" />
+                  <input type="number" placeholder="Nilai (Rp/bln)" value={row.nilai} onChange={(e) => handleOpexChange(i, 'nilai', e.target.value)} className="col-span-1 border rounded-xl px-3 py-2" />
+                  <button className="col-span-1 border rounded-xl" onClick={(ev) => { ev.preventDefault(); const arr = [...opex]; arr.splice(i, 1); setOpex(arr); }}>✕</button>
+                </div>
+              ))}
+            </div>
+            <div className="text-xs text-slate-600 mt-2">Total OPEX/bulan: <b>{CURRENCY(totalOpex)}</b></div>
+          </div>
+
+          {/* Financing */}
+          <div className="mt-6">
+            <h3 className="font-semibold">Rencana Pengembalian Pinjaman</h3>
+            <div className="grid md:grid-cols-5 gap-3 mt-2">
+              <label className="text-sm">Plafon (Rp)
+                <input type="number" value={plafon} onChange={(e) => setPlafon(Number(e.target.value))} className="mt-1 w-full border rounded-xl px-3 py-2" />
+              </label>
+              <label className="text-sm">Tenor (bln)
+                <input type="number" min={1} max={120} value={tenor} onChange={(e) => setTenor(Number(e.target.value))} className="mt-1 w-full border rounded-xl px-3 py-2" />
+              </label>
+              <label className="text-sm">Bunga (%/th)
+                <input type="number" value={bunga} onChange={(e) => setBunga(Number(e.target.value))} className="mt-1 w-full border rounded-xl px-3 py-2" />
+              </label>
+              <label className="text-sm">Grace (bln)
+                <input type="number" min={0} max={12} value={grace} onChange={(e) => setGrace(Number(e.target.value))} className="mt-1 w-full border rounded-xl px-3 py-2" />
+              </label>
+              <label className="text-sm">Mode Grace
+                <select value={modeGrace} onChange={(e) => setModeGrace(e.target.value)} className="mt-1 w-full border rounded-xl px-3 py-2">
+                  <option value="pokok">Bayar bunga saja</option>
+                  <option value="full">Full grace (kapitalisasi bunga)</option>
+                </select>
+              </label>
+            </div>
+          </div>
+
+          <div className="mt-6">
+            <button onClick={exportExcel} className="px-4 py-2 rounded-xl bg-emerald-600 text-white">Export Excel</button>
+          </div>
+        </section>
+
+        {/* RIGHT: Dashboard */}
+        <section className="bg-white border rounded-2xl shadow-sm p-6">
+          <h2 className="text-xl font-bold">Dashboard</h2>
+          <div className="grid md:grid-cols-3 gap-3 mt-4 text-sm">
+            <div className="p-4 rounded-xl bg-slate-100">
+              <div className="font-semibold">Total CAPEX</div>
+              <div className="text-2xl">{CURRENCY(totalCapex)}</div>
+            </div>
+            <div className="p-4 rounded-xl bg-slate-100">
+              <div className="font-semibold">Total OPEX/bulan</div>
+              <div className="text-2xl">{CURRENCY(totalOpex)}</div>
+            </div>
+            <div className="p-4 rounded-xl bg-slate-100">
+              <div className="font-semibold">Penyusutan/bulan</div>
+              <div className="text-2xl">{CURRENCY(penyusutanBulanan)}</div>
+            </div>
+            <div className="p-4 rounded-xl bg-slate-100">
+              <div className="font-semibold">Target Laba/bulan</div>
+              <div className="text-2xl">{CURRENCY(labaTargetBulanan)}</div>
+            </div>
+            <div className="p-4 rounded-xl bg-slate-100">
+              <div className="font-semibold">BEP (perkiraan)</div>
+              <div className="text-2xl">{isFinite(BEP_Bulan) ? `${BEP_Bulan} bln` : 'Tidak tercapai'}</div>
+            </div>
+            <div className="p-4 rounded-xl bg-slate-100">
+              <div className="font-semibold">Payback</div>
+              <div className="text-2xl">{isFinite(payback) ? `${payback} bln` : '> horizon'}</div>
+            </div>
+          </div>
+
+          {/* Loan Snapshot */}
+          <div className="mt-6">
+            <h3 className="font-semibold">Rencana Pengembalian (Ringkas)</h3>
+            <div className="overflow-auto mt-2">
+              <table className="min-w-full text-xs">
+                <thead>
+                  <tr className="bg-slate-100">
+                    <th className="p-2 text-left">Bulan</th>
+                    <th className="p-2 text-right">Pokok</th>
+                    <th className="p-2 text-right">Bunga</th>
+                    <th className="p-2 text-right">Angsuran</th>
+                    <th className="p-2 text-right">Saldo</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {loanSchedule.slice(0, Math.min(12, loanSchedule.length)).map((r) => (
+                    <tr key={r.month} className="odd:bg-white even:bg-slate-50">
+                      <td className="p-2">{r.month}</td>
+                      <td className="p-2 text-right">{CURRENCY(r.principal)}</td>
+                      <td className="p-2 text-right">{CURRENCY(r.interest)}</td>
+                      <td className="p-2 text-right">{CURRENCY(r.payment)}</td>
+                      <td className="p-2 text-right">{CURRENCY(r.balance)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="text-xs text-slate-500 mt-2">Menampilkan 12 bulan pertama. Detail lengkap tersedia di Export Excel & dapat disesuaikan di parameter pinjaman.</div>
+            </div>
+          </div>
+
+          {/* Cashflow Snapshot */}
+          <div className="mt-6">
+            <h3 className="font-semibold">Cashflow Projection (Ringkas)</h3>
+            <div className="overflow-auto mt-2">
+              <table className="min-w-full text-xs">
+                <thead>
+                  <tr className="bg-slate-100">
+                    <th className="p-2 text-left">Bulan</th>
+                    <th className="p-2 text-right">Pendapatan</th>
+                    <th className="p-2 text-right">OPEX</th>
+                    <th className="p-2 text-right">Penyusutan</th>
+                    <th className="p-2 text-right">Bunga</th>
+                    <th className="p-2 text-right">Angsuran</th>
+                    <th className="p-2 text-right">Net CF</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {cashflowRows.rows.slice(0, 12).map((r) => (
+                    <tr key={r.bulan} className="odd:bg-white even:bg-slate-50">
+                      <td className="p-2">{r.bulan}</td>
+                      <td className="p-2 text-right">{CURRENCY(r.pendapatan)}</td>
+                      <td className="p-2 text-right">{CURRENCY(r.opex)}</td>
+                      <td className="p-2 text-right">{CURRENCY(r.penyusutan)}</td>
+                      <td className="p-2 text-right">{CURRENCY(r.bunga)}</td>
+                      <td className="p-2 text-right">{CURRENCY(r.angsuran)}</td>
+                      <td className="p-2 text-right">{CURRENCY(r.netCF)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="text-xs text-slate-500 mt-2">Arus kas awal (bulan 0) = -CAPEX + Pencairan Pinjaman = {CURRENCY(-totalCapex + plafon)}</div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
